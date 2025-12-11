@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>机械臂3D可视化工具</title>
+    <link rel="stylesheet" href="robot_arm.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div id="app">
+        <!-- 侧边栏收起/展开按钮 -->
+        <button id="sidebar-toggle" class="sidebar-toggle" onclick="RobotArm.toggleSidebar()" title="收起/展开侧边栏">
+            <span id="toggle-icon">◀</span>
+        </button>
+        
+        <!-- 左侧输入面板 -->
+        <aside id="input-panel">
+            <header class="panel-header">
+                <h1>🦾 机械臂可视化设计</h1>
+            </header>
+
+            <!-- 全局设置 -->
+            <section class="panel-section">
+                <h2>⚙️ 全局设置</h2>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="link-radius">连杆半径 (mm)</label>
+                        <input type="number" id="link-radius" min="1" max="50" step="1" value="25">
+                    </div>
+                    <div class="form-group">
+                        <label for="axis-size">坐标轴粗细</label>
+                        <input type="number" id="axis-size" min="0.5" max="3" step="0.1" value="3">
+                    </div>
+                    <div class="form-group">
+                        <label for="angle-unit">角度单位</label>
+                        <select id="angle-unit">
+                            <option value="degree" selected>度 (°)</option>
+                            <option value="radian">弧度 (rad)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="joint-diameter">关节直径 (mm)</label>
+                        <input type="number" id="joint-diameter" min="5" max="100" step="1" value="60">
+                    </div>
+                    <div class="form-group">
+                        <label for="joint-height">关节高度 (mm)</label>
+                        <input type="number" id="joint-height" min="5" max="200" step="1" value="60">
+                    </div>
+                </div>
+                <div class="checkbox-row">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="show-axes" checked>
+                        <span>显示坐标轴</span>
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="show-labels" checked>
+                        <span>显示标签</span>
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="enable-ik" checked onchange="RobotArm.toggleIK(this.checked)">
+                        <span>启用IK拖拽</span>
+                    </label>
+                </div>
+            </section>
+
+            <!-- 关节配置表 -->
+            <section class="panel-section">
+                <h2>🔧 关节配置</h2>
+                <div class="info-card">
+                    <p><strong>物理结构描述：</strong>定义每个关节相对于上一关节的位姿变换（关节变量=0时）</p>
+                    <ul>
+                        <li><strong>位置 (x,y,z)</strong>：关节原点相对于上一关节坐标系的位置 (mm)</li>
+                        <li><strong>方向 (rx,ry,rz)</strong>：关节坐标系的欧拉角 ZYX顺序 (°)</li>
+                        <li><strong>关节轴</strong>：默认为局部Z轴</li>
+                    </ul>
+                </div>
+                
+                <div class="joint-table-container">
+                    <table class="joint-table" id="joint-table">
+                        <thead>
+                            <tr>
+                                <th class="col-idx">#</th>
+                                <th class="col-type">类型</th>
+                                <th class="col-pos">x</th>
+                                <th class="col-pos">y</th>
+                                <th class="col-pos">z</th>
+                                <th class="col-rot">rx</th>
+                                <th class="col-rot">ry</th>
+                                <th class="col-rot">rz</th>
+                                <th class="col-limit">下限</th>
+                                <th class="col-limit">上限</th>
+                                <th class="col-linkmode" title="连杆延伸方式">连杆</th>
+                                <th class="col-visibility">显示</th>
+                                <th class="col-action">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="joint-table-body">
+                            <!-- 动态生成 -->
+                        </tbody>
+                    </table>
+                </div>
+                <button class="btn btn-primary" onclick="RobotArm.addJoint()">
+                    <span class="btn-icon">+</span> 添加关节
+                </button>
+            </section>
+
+            <!-- 文件操作 -->
+            <section class="panel-section">
+                <h2>💾 配置管理</h2>
+                <div class="button-row">
+                    <button class="btn btn-secondary" onclick="RobotArm.saveConfig()">
+                        📥 保存配置
+                    </button>
+                    <label class="btn btn-secondary file-input-label">
+                        📤 加载配置
+                        <input type="file" id="file-input" accept=".json" onchange="RobotArm.loadConfig(event)" hidden>
+                    </label>
+                </div>
+                <div class="button-row">
+                    <button class="btn btn-accent" onclick="RobotArm.exportMDH()">
+                        📊 导出MDH参数
+                    </button>
+                </div>
+            </section>
+
+            <!-- MDH参数显示 -->
+            <section class="panel-section" id="mdh-section" style="display: none;">
+                <h2>📐 MDH参数 (Craig约定)</h2>
+                <div class="info-card info-card-mdh">
+                    <p>变换顺序: T = Rx(α<sub>i-1</sub>) · Tx(a<sub>i-1</sub>) · Rz(θ<sub>i</sub>) · Tz(d<sub>i</sub>)</p>
+                </div>
+                <div class="mdh-table-container">
+                    <table class="mdh-table" id="mdh-table">
+                        <thead>
+                            <tr>
+                                <th>i</th>
+                                <th>α<sub>i-1</sub></th>
+                                <th>a<sub>i-1</sub></th>
+                                <th>d<sub>i</sub></th>
+                                <th>θ<sub>i</sub></th>
+                            </tr>
+                        </thead>
+                        <tbody id="mdh-table-body">
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- 工作空间 -->
+            <section class="panel-section">
+                <h2>🎯 工作空间可视化</h2>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="workspace-samples">采样数量</label>
+                        <input type="number" id="workspace-samples" min="100000" max="10000000" step="1000" value="1000000">
+                    </div>
+                    <div class="form-group">
+                        <label for="voxel-size">体素边长 (mm)</label>
+                        <input type="number" id="voxel-size" min="1" max="200" step="1" value="50">
+                    </div>
+                </div>
+                <div class="button-row">
+                    <button class="btn btn-warning" id="render-workspace-btn" onclick="RobotArm.renderWorkspace()">
+                        🔮 渲染工作空间
+                    </button>
+                    <button class="btn btn-danger" onclick="RobotArm.clearWorkspace()">
+                        🗑️ 清除
+                    </button>
+                    <button class="btn btn-secondary" onclick="RobotArm.takeScreenshot()">
+                        📷 截图
+                    </button>
+                </div>
+                <div class="progress-container" id="progress-container">
+                    <div class="progress-bar" id="progress-bar"></div>
+                    <span class="progress-text" id="progress-text">0%</span>
+                </div>
+                <div id="workspace-volume" class="info-card" style="display:none; margin-top:8px;">
+                    <p>工作空间体积: <span id="workspace-volume-value">--</span> m³</p>
+                </div>
+            </section>
+        </aside>
+
+        <!-- 3D视图区域 -->
+        <main id="canvas-container">
+            <canvas id="canvas3d"></canvas>
+            
+            <!-- 操作说明 -->
+            <div id="instructions-panel" class="floating-panel collapsible">
+                <h3 onclick="RobotArm.toggleInstructions()">
+                    🎯 操作说明
+                    <span class="collapse-icon" id="collapse-icon">▼</span>
+                </h3>
+                <div id="instructions-content" class="instructions-content">
+                    <div class="instruction-section">
+                        <p class="instruction-title">IK交互（拖拽末端Gizmo）：</p>
+                        <ul>
+                            <li><kbd>G</kbd> 平移模式 / <kbd>R</kbd> 旋转模式</li>
+                            <li><kbd>X</kbd> <kbd>Y</kbd> <kbd>Z</kbd> 轴向约束</li>
+                            <li><kbd>Esc</kbd> 取消约束</li>
+                        </ul>
+                    </div>
+                    <div class="instruction-section">
+                        <p class="instruction-title">视角控制：</p>
+                        <ul>
+                            <li>中键拖拽 → 旋转视角</li>
+                            <li>右键拖拽 → 平移视角</li>
+                            <li>滚轮 → 缩放</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 关节控制面板 -->
+            <div id="joint-control" class="floating-panel floating-panel-right">
+                <h3>🎛️ 关节控制</h3>
+                <div id="sliders-container"></div>
+                <button class="btn btn-secondary btn-small" onclick="RobotArm.resetJoints()">重置</button>
+            </div>
+
+            <!-- 状态信息 -->
+            <div id="status-bar" class="status-bar">
+                <span id="status-joints">关节: 0</span>
+                <span id="status-pos">末端: (0, 0, 0)</span>
+            </div>
+        </main>
+    </div>
+
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/TransformControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/renderers/CSS2DRenderer.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/objects/CSS2DObject.js"></script>
+    
+    <!-- IK求解模块 -->
+    <script src="robot_arm_ik.js"></script>
+    <script src="robot_arm.js"></script>
+</body>
+</html>
+
