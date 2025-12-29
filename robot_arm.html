@@ -164,6 +164,41 @@
                         <input type="number" id="voxel-size" min="1" max="200" step="1" value="50">
                     </div>
                 </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="dexterous-threshold" title="综合灵活度高于此阈值显示为灵活空间">灵活度阈值</label>
+                        <input type="number" id="dexterous-threshold" min="0" max="1" step="0.05" value="0.40">
+                    </div>
+                </div>
+                <div class="info-card" style="margin-top: 8px; font-size: 12px;">
+                    <p><strong>灵活度公式（尺度一致）：</strong></p>
+                    <p>D = 0.55 × M'<sub>norm</sub> + 0.45 × I<sub>norm</sub></p>
+                    <p style="margin-top: 4px; font-size: 11px; opacity: 0.8;">
+                        M': 基于归一化雅可比 J'=[J<sub>v</sub>/l<sub>c</sub>; J<sub>ω</sub>] 的可操作度<br>
+                        I: 对数尺度各向同性 (软约束κ<100)<br>
+                        l<sub>c</sub>=700mm (特征长度，消除量纲差异)
+                    </p>
+                    <p style="margin-top: 6px; font-size: 11px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 4px;">
+                        <strong>条件数评价：</strong><br>
+                        κ<5: 优秀 | κ<20: 良好 | κ<80: 可接受 | κ<100: 极限
+                    </p>
+                    <p style="margin-top: 4px; font-size: 11px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 4px;">
+                        <strong>颜色映射：</strong><br>
+                        <span style="color: #ff4444;">🔴 红色</span> → 低灵活度<br>
+                        <span style="color: #ffdd44;">🟡 黄色</span> → 中等灵活度<br>
+                        <span style="color: #44ff44;">🟢 绿色</span> → 高灵活度
+                    </p>
+                </div>
+                <div class="checkbox-row">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="compute-dexterous" checked>
+                        <span>计算灵活度分布</span>
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="show-gradient" checked>
+                        <span>渐变色彩显示</span>
+                    </label>
+                </div>
                 <div class="button-row">
                     <button class="btn btn-warning" id="render-workspace-btn" onclick="RobotArm.renderWorkspace()">
                         🔮 渲染工作空间
@@ -180,7 +215,11 @@
                     <span class="progress-text" id="progress-text">0%</span>
                 </div>
                 <div id="workspace-volume" class="info-card" style="display:none; margin-top:8px;">
-                    <p>工作空间体积: <span id="workspace-volume-value">--</span> m³</p>
+                    <p><strong>可达空间体积:</strong> <span id="reachable-volume-value">--</span> m³</p>
+                    <p id="dexterous-info" style="display:none;">
+                        <strong>灵活空间体积:</strong> <span id="dexterous-volume-value">--</span> m³<br>
+                        <strong>灵活空间占比:</strong> <span id="dexterous-percentage-value">--</span>%
+                    </p>
                 </div>
             </section>
         </aside>

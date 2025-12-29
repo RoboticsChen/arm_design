@@ -115,6 +115,579 @@ const RobotArm = (function() {
         const volumeMm3 = occupied.size * Math.pow(voxelSize, 3);
         return volumeMm3 / 1e9; // 转换为立方米
     }
+    
+    // ========================================
+    // 灵活空间分析 - 基于可操作度和各向同性指数
+    // ========================================
+    
+    /**
+     * 已删除：基于采样的方法和Worker相关代码
+     * 现在使用快速的几何指标方法
+     */
+    
+    /**
+     * 【已废弃】创建内联Worker
+     * 保留代码结构以防未来需要
+     */
+    function createInlineWorker_DEPRECATED() {
+        const workerCode = `
+        // Worker代码（内联）
+        'use strict';
+        
+        class Vec3 {
+            constructor(x = 0, y = 0, z = 0) {
+                this.x = x; this.y = y; this.z = z;
+            }
+            clone() { return new Vec3(this.x, this.y, this.z); }
+            add(v) { this.x += v.x; this.y += v.y; this.z += v.z; return this; }
+            sub(v) { this.x -= v.x; this.y -= v.y; this.z -= v.z; return this; }
+            multiplyScalar(s) { this.x *= s; this.y *= s; this.z *= s; return this; }
+            dot(v) { return this.x * v.x + this.y * v.y + this.z * v.z; }
+            cross(v) {
+                const x = this.y * v.z - this.z * v.y;
+                const y = this.z * v.x - this.x * v.z;
+                const z = this.x * v.y - this.y * v.x;
+                return new Vec3(x, y, z);
+            }
+            length() { return Math.sqrt(this.x * this.x + this.y * this.y + this.z * this.z); }
+            normalize() {
+                const len = this.length();
+                if (len > 0) this.multiplyScalar(1 / len);
+                return this;
+            }
+            distanceTo(v) {
+                const dx = this.x - v.x, dy = this.y - v.y, dz = this.z - v.z;
+                return Math.sqrt(dx * dx + dy * dy + dz * dz);
+            }
+        }
+        
+        class Mat4 {
+            constructor() {
+                this.elements = new Float32Array(16);
+                this.identity();
+            }
+            identity() {
+                const e = this.elements;
+                e[0]=1;e[4]=0;e[8]=0;e[12]=0;e[1]=0;e[5]=1;e[9]=0;e[13]=0;
+                e[2]=0;e[6]=0;e[10]=1;e[14]=0;e[3]=0;e[7]=0;e[11]=0;e[15]=1;
+                return this;
+            }
+            clone() {
+                const m = new Mat4();
+                m.elements.set(this.elements);
+                return m;
+            }
+            multiply(m) {
+                const ae = this.elements, be = m.elements;
+                const result = new Float32Array(16);
+                for (let i = 0; i < 4; i++) {
+                    for (let j = 0; j < 4; j++) {
+                        result[i*4+j] = ae[i*4]*be[j] + ae[i*4+1]*be[4+j] + 
+                                        ae[i*4+2]*be[8+j] + ae[i*4+3]*be[12+j];
+                    }
+                }
+                this.elements = result;
+                return this;
+            }
+            makeTranslation(x,y,z) {
+                this.identity(); this.elements[12]=x; this.elements[13]=y; this.elements[14]=z;
+                return this;
+            }
+            makeRotationZ(theta) {
+                const c=Math.cos(theta), s=Math.sin(theta);
+                this.identity(); this.elements[0]=c; this.elements[1]=s;
+                this.elements[4]=-s; this.elements[5]=c;
+                return this;
+            }
+            makeRotationFromEuler(rx,ry,rz) {
+                const cx=Math.cos(rx),sx=Math.sin(rx),cy=Math.cos(ry),sy=Math.sin(ry);
+                const cz=Math.cos(rz),sz=Math.sin(rz);
+                const e=this.elements;
+                e[0]=cy*cz;e[1]=cy*sz;e[2]=-sy;e[3]=0;
+                e[4]=sx*sy*cz-cx*sz;e[5]=sx*sy*sz+cx*cz;e[6]=sx*cy;e[7]=0;
+                e[8]=cx*sy*cz+sx*sz;e[9]=cx*sy*sz-sx*cz;e[10]=cx*cy;e[11]=0;
+                e[12]=0;e[13]=0;e[14]=0;e[15]=1;
+                return this;
+            }
+            getPosition() { return new Vec3(this.elements[12],this.elements[13],this.elements[14]); }
+            transformVector(v) {
+                const e=this.elements, x=v.x, y=v.y, z=v.z;
+                return new Vec3(e[0]*x+e[4]*y+e[8]*z, e[1]*x+e[5]*y+e[9]*z, e[2]*x+e[6]*y+e[10]*z);
+            }
+        }
+        
+        function buildBaseTransform(joint) {
+            const trans = new Mat4().makeTranslation(joint.x, joint.y, joint.z);
+            const rot = new Mat4().makeRotationFromEuler(
+                joint.rx*Math.PI/180, joint.ry*Math.PI/180, joint.rz*Math.PI/180);
+            return trans.clone().multiply(rot);
+        }
+        
+        function buildJointTransform(type,value) {
+            return type==='R' ? new Mat4().makeRotationZ(value) : new Mat4().makeTranslation(0,0,value);
+        }
+        
+        function computeEndPosition(joints,values) {
+            let T=new Mat4();
+            for(let i=0;i<joints.length;i++){
+                T=T.clone().multiply(buildBaseTransform(joints[i])).multiply(buildJointTransform(joints[i].type,values[i]));
+            }
+            return T.getPosition();
+        }
+        
+        function computeFullFK(joints,values) {
+            const positions=[new Vec3(0,0,0)];
+            let T=new Mat4();
+            for(let i=0;i<joints.length;i++){
+                T=T.clone().multiply(buildBaseTransform(joints[i])).multiply(buildJointTransform(joints[i].type,values[i]));
+                positions.push(T.getPosition());
+            }
+            return {positions,endTransform:T};
+        }
+        
+        function solveCCDPosition(joints,currentValues,targetPos) {
+            if(joints.length===0) return null;
+            const values=[...currentValues];
+            const maxIter=50, tolerance=15;
+            
+            for(let iter=0;iter<maxIter;iter++){
+                for(let i=joints.length-1;i>=0;i--){
+                    const joint=joints[i];
+                    if(joint.type==='R'){
+                        const fk=computeFullFK(joints,values);
+                        const jointPos=fk.positions[i], endPos=computeEndPosition(joints,values);
+                        let T=new Mat4();
+                        for(let j=0;j<i;j++){
+                            T=T.clone().multiply(buildBaseTransform(joints[j])).multiply(buildJointTransform(joints[j].type,values[j]));
+                        }
+                        if(i>0) T=T.clone().multiply(buildBaseTransform(joints[i]));
+                        const zAxis=T.transformVector(new Vec3(0,0,1)).normalize();
+                        const toEnd=endPos.clone().sub(jointPos);
+                        const toTarget=targetPos.clone().sub(jointPos);
+                        const toEndProj=toEnd.clone().sub(zAxis.clone().multiplyScalar(toEnd.dot(zAxis)));
+                        const toTargetProj=toTarget.clone().sub(zAxis.clone().multiplyScalar(toTarget.dot(zAxis)));
+                        if(toEndProj.length()<0.001||toTargetProj.length()<0.001) continue;
+                        toEndProj.normalize(); toTargetProj.normalize();
+                        let angle=Math.acos(Math.max(-1,Math.min(1,toEndProj.dot(toTargetProj))));
+                        const cross=toEndProj.cross(toTargetProj);
+                        if(cross.dot(zAxis)<0) angle=-angle;
+                        angle=Math.max(-0.5,Math.min(0.5,angle));
+                        values[i]+=angle;
+                        const minLimit=joint.min!==undefined?joint.min*Math.PI/180:-Math.PI;
+                        const maxLimit=joint.max!==undefined?joint.max*Math.PI/180:Math.PI;
+                        values[i]=Math.max(minLimit,Math.min(maxLimit,values[i]));
+                    }
+                }
+                const currentEnd=computeEndPosition(joints,values);
+                const error=currentEnd.distanceTo(targetPos);
+                if(error<tolerance) return {values,success:true,error};
+            }
+            const finalError=computeEndPosition(joints,values).distanceTo(targetPos);
+            return {values,success:finalError<tolerance,error:finalError};
+        }
+        
+        self.onmessage = function(e) {
+            const {type,data} = e.data;
+            if(type==='test_points'){
+                const {points,joints,orientations,threshold,workerId} = data;
+                const results=[];
+                for(let i=0;i<points.length;i++){
+                    const point=new Vec3(points[i].x,points[i].y,points[i].z);
+                    let reachableCount=0;
+                    for(let j=0;j<orientations.length;j++){
+                        const initialGuess=joints.map(()=>0);
+                        const result=solveCCDPosition(joints,initialGuess,point);
+                        if(result && result.success) reachableCount++;
+                    }
+                    const coverage=reachableCount/orientations.length;
+                    results.push({point:points[i],isDexterous:coverage>=threshold,coverage});
+                    if(i%5===0){
+                        self.postMessage({type:'progress',workerId,processed:i+1,total:points.length});
+                    }
+                }
+                self.postMessage({type:'complete',workerId,results});
+            }
+        };
+        `;
+        
+        const blob = new Blob([workerCode], { type: 'application/javascript' });
+        return new Worker(URL.createObjectURL(blob));
+    }
+    
+    /**
+     * 使用Web Workers并行测试灵活空间
+     */
+    async function testDexterousWorkspaceParallel(points, orientations, threshold, numWorkers, onProgress) {
+        return new Promise((resolve, reject) => {
+            const workers = [];
+            const results = [];
+            let completedWorkers = 0;
+            const workerProgress = new Array(numWorkers).fill(0);
+            
+            // 将点分配给各个Worker
+            const pointsPerWorker = Math.ceil(points.length / numWorkers);
+            
+            for (let i = 0; i < numWorkers; i++) {
+                const worker = createInlineWorker();
+                const startIdx = i * pointsPerWorker;
+                const endIdx = Math.min((i + 1) * pointsPerWorker, points.length);
+                const workerPoints = points.slice(startIdx, endIdx);
+                
+                if (workerPoints.length === 0) continue;
+                
+                worker.onmessage = function(e) {
+                    const { type, workerId, processed, total, results: workerResults } = e.data;
+                    
+                    if (type === 'progress') {
+                        workerProgress[i] = processed / total;
+                        const totalProgress = workerProgress.reduce((a, b) => a + b, 0) / numWorkers;
+                        if (onProgress) onProgress(totalProgress);
+                    } else if (type === 'complete') {
+                        results.push(...workerResults);
+                        completedWorkers++;
+                        
+                        worker.terminate();
+                        
+                        if (completedWorkers === workers.length) {
+                            resolve(results);
+                        }
+                    }
+                };
+                
+                worker.onerror = function(error) {
+                    console.error('Worker error:', error);
+                    worker.terminate();
+                    reject(error);
+                };
+                
+                // 发送任务
+                worker.postMessage({
+                    type: 'test_points',
+                    data: {
+                        points: workerPoints.map(p => ({ x: p.x, y: p.y, z: p.z })),
+                        joints: joints,
+                        orientations: orientations.map(q => ({
+                            x: q.x, y: q.y, z: q.z, w: q.w
+                        })),
+                        threshold: threshold,
+                        workerId: i
+                    }
+                });
+                
+                workers.push(worker);
+            }
+            
+            if (workers.length === 0) {
+                resolve([]);
+            }
+        });
+    }
+    
+    // ========================================
+    // 灵活空间分析 - 基于可操作度和条件数
+    // ========================================
+    
+    // 灵活度计算常量配置
+    const DEXTERITY_CONFIG = {
+        // 特征长度（消除量纲不一致性，Angeles 1992）
+        CHARACTERISTIC_LENGTH: 700,       // mm（对应典型机械臂臂展0.7m）
+        
+        // 条件数评价区间（基于工业机器人实践 & 文献）
+        KAPPA_EXCELLENT: 5,               // 优秀：κ < 5（接近各向同性）
+        KAPPA_GOOD: 20,                   // 良好：κ < 20
+        KAPPA_ACCEPTABLE: 80,             // 可接受：κ < 80
+        KAPPA_LIMIT: 100,                 // 极限：κ < 100（Angeles 1997建议）
+        
+        // 综合灵活度权重（Klein & Blaho 1987）
+        WEIGHT_MANIPULABILITY: 0.55,      // 可操作度权重（略倾向运动能力）
+        WEIGHT_ISOTROPY: 0.45,            // 各向同性权重（均衡性）
+        
+        // 数值稳定性阈值
+        MIN_DET_THRESHOLD: 1e-10,         // 行列式最小阈值（防止除零）
+        MIN_TRACE_THRESHOLD: 1e-10,       // 迹最小阈值（防止除零）
+        
+        // IK求解容差
+        MAX_IK_ERROR: 20,                 // IK位置误差上限（mm）
+        
+        // 软约束参数（平滑过渡）
+        SIGMOID_STEEPNESS: 0.05           // Sigmoid陡度（文献建议0.05-0.1）
+    };
+    
+    /**
+     * 计算尺度一致的雅可比矩阵（Scale-Consistent Jacobian）
+     * 
+     * 使用特征长度 l_c 消除平移与旋转的量纲不一致性
+     * J' = [J_v / l_c; J_ω]
+     * 
+     * 参考文献：
+     * - Angeles, J. (1992). "The Design of Isotropic Manipulator Architectures..."
+     * - Cardou & Bouchard (2010). "Kinematic-Sensitivity Indices..."
+     * 
+     * @param {Array} config 关节配置（弧度/mm）
+     * @returns {Array} 6×n 尺度一致雅可比矩阵（无量纲）
+     */
+    function computeJacobian(config) {
+        const n = joints.length;
+        const J = [];
+        const l_c = DEXTERITY_CONFIG.CHARACTERISTIC_LENGTH; // 特征长度（mm）
+        
+        // 计算FK
+        const fk = computeFK(config);
+        const endPos = fk.positions[fk.positions.length - 1];
+        
+        for (let i = 0; i < n; i++) {
+            const joint = joints[i];
+            const jointPos = fk.positions[i];
+            const zAxis = fk.zAxes[i + 1]; // 关节轴方向
+            
+            if (joint.type === 'R') {
+                // 转动关节：J_v = z × (p_end - p_joint), J_ω = z
+                const toEnd = new THREE.Vector3().subVectors(endPos, jointPos);
+                const Jv = new THREE.Vector3().crossVectors(zAxis, toEnd);
+                const Jw = zAxis.clone();
+                
+                // 尺度一致化：平移部分除以特征长度
+                J.push([Jv.x/l_c, Jv.y/l_c, Jv.z/l_c, Jw.x, Jw.y, Jw.z]);
+            } else {
+                // 平动关节：J_v = z, J_ω = 0
+                // 同样需要归一化平移部分
+                J.push([zAxis.x/l_c, zAxis.y/l_c, zAxis.z/l_c, 0, 0, 0]);
+            }
+        }
+        
+        return J; // n × 6 矩阵（尺度一致，无量纲）
+    }
+    
+    /**
+     * 计算归一化雅可比矩阵的 J'·J'^T（用于可操作度和条件数计算）
+     * 
+     * 注意：J' 已经过尺度一致化处理（J_v/l_c），因此：
+     * - det(J'J'^T) 是无量纲量，具有明确物理意义
+     * - κ(J') 与机器人尺寸无关，可比较不同机器人
+     * 
+     * @param {Array} config 关节配置
+     * @returns {Array|null} 3×3矩阵 J'J'^T，如果失败返回null
+     */
+    function computeJJT(config) {
+        const J = computeJacobian(config);  // 获取尺度一致雅可比 J'
+        if (J.length === 0) return null;
+        
+        const n = J.length;
+        // 提取平移部分（前3列，已归一化）
+        const Jv = J.map(row => [row[0], row[1], row[2]]);
+        
+        // 计算 J'_v · J'^T_v (3×3矩阵)
+        const JJT = [
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0]
+        ];
+        
+        for (let i = 0; i < 3; i++) {
+            for (let j = 0; j < 3; j++) {
+                for (let k = 0; k < n; k++) {
+                    JJT[i][j] += Jv[k][i] * Jv[k][j];
+                }
+            }
+        }
+        
+        return JJT;  // 无量纲3×3矩阵
+    }
+    
+    /**
+     * 计算尺度一致可操作度 M' (Yoshikawa 1985)
+     * M' = sqrt(det(J'·J'^T))
+     * 
+     * 物理意义：
+     * - 刻画机器人在任务空间中的"瞬时运动能力"
+     * - 无量纲量，可比较不同尺寸机器人
+     * - 值越大表示运动能力越强
+     * 
+     * @param {Array} JJT 尺度一致的 J'·J'^T (3×3无量纲矩阵)
+     * @returns {number} 可操作度指标（无量纲）
+     */
+    function computeManipulability(JJT) {
+        if (!JJT) return 0;
+        
+        // 计算3×3矩阵的行列式
+        const det = JJT[0][0] * (JJT[1][1] * JJT[2][2] - JJT[1][2] * JJT[2][1])
+                  - JJT[0][1] * (JJT[1][0] * JJT[2][2] - JJT[1][2] * JJT[2][0])
+                  + JJT[0][2] * (JJT[1][0] * JJT[2][1] - JJT[1][1] * JJT[2][0]);
+        
+        return Math.sqrt(Math.max(0, det));
+    }
+    
+    /**
+     * 计算条件数 κ(J') = sqrt(λ_max / λ_min)
+     * 
+     * 物理意义：
+     * - 刻画机器人运动能力的"各向同性程度"
+     * - κ=1: 完美各向同性（最优）
+     * - κ越大: 某方向运动能力越弱（接近奇异）
+     * - 由于J'无量纲，κ与机器人尺寸无关
+     * 
+     * @param {Array} JJT 尺度一致的 J'·J'^T (3×3无量纲矩阵)
+     * @returns {number} 条件数（≥1，越小越好）
+     */
+    function computeConditionNumber(JJT) {
+        if (!JJT) return Infinity;
+        
+        // 计算迹和行列式（数值稳定性检查）
+        const trace = JJT[0][0] + JJT[1][1] + JJT[2][2];
+        const det = JJT[0][0] * (JJT[1][1] * JJT[2][2] - JJT[1][2] * JJT[2][1])
+                  - JJT[0][1] * (JJT[1][0] * JJT[2][2] - JJT[1][2] * JJT[2][0])
+                  + JJT[0][2] * (JJT[1][0] * JJT[2][1] - JJT[1][1] * JJT[2][0]);
+        
+        // 数值稳定性检查：避免除零
+        if (det < DEXTERITY_CONFIG.MIN_DET_THRESHOLD || 
+            trace < DEXTERITY_CONFIG.MIN_TRACE_THRESHOLD) {
+            return Infinity;
+        }
+        
+        // 特征值近似：λ_max ≈ trace, λ_min ≈ det/trace²
+        const lambda_max = trace;
+        const lambda_min = det / (trace * trace);
+        
+        if (lambda_min < DEXTERITY_CONFIG.MIN_DET_THRESHOLD) {
+            return Infinity;
+        }
+        
+        // 条件数 κ = sqrt(λ_max / λ_min)
+        return Math.sqrt(lambda_max / lambda_min);
+    }
+    
+    /**
+     * 计算归一化各向同性指数（对数尺度 + Sigmoid软约束）
+     * 
+     * 方法：
+     * 1. 对数映射：log_score = (log(κ_good) - log(κ)) / (log(κ_good) - log(κ_excellent))
+     * 2. Sigmoid软约束：处理超出区间的情况，平滑过渡
+     * 
+     * @param {number} kappa 条件数
+     * @returns {number} 归一化各向同性指数（0-1，越大越好）
+     */
+    function computeNormalizedIsotropy(kappa) {
+        const cfg = DEXTERITY_CONFIG;
+        
+        // 数值稳定性检查
+        if (!isFinite(kappa) || kappa < 1) {
+            return kappa < 1 ? 1.0 : 0.0;
+        }
+        
+        // 极限情况：κ > 150 时使用Sigmoid软衰减
+        if (kappa > cfg.KAPPA_LIMIT) {
+            // 软约束：Sigmoid衰减，避免硬截断
+            // I_norm = exp(-steepness * (κ - κ_limit))
+            const excess = kappa - cfg.KAPPA_LIMIT;
+            const decay = Math.exp(-cfg.SIGMOID_STEEPNESS * excess);
+            return Math.max(0, decay * 0.1);  // 最多保留10%得分
+        }
+        
+        // 对数尺度归一化（更符合条件数的指数特性）
+        // 将 [κ_excellent, κ_good] 映射到 [1.0, 0.5]
+        // 将 [κ_good, κ_acceptable] 映射到 [0.5, 0.1]
+        // 将 [κ_acceptable, κ_limit] 映射到 [0.1, 0.0]
+        
+        let I_norm;
+        
+        if (kappa <= cfg.KAPPA_EXCELLENT) {
+            // 优秀区间：κ ≤ 5，接近完美
+            I_norm = 1.0;
+            
+        } else if (kappa <= cfg.KAPPA_GOOD) {
+            // 优秀到良好：κ ∈ (5, 20]，对数插值
+            // log scale: 避免线性插值的不均匀分布
+            const logKappa = Math.log(kappa);
+            const logMin = Math.log(cfg.KAPPA_EXCELLENT);
+            const logMax = Math.log(cfg.KAPPA_GOOD);
+            const ratio = (logKappa - logMin) / (logMax - logMin);
+            I_norm = 1.0 - 0.5 * ratio;  // 1.0 → 0.5
+            
+        } else if (kappa <= cfg.KAPPA_ACCEPTABLE) {
+            // 良好到可接受：κ ∈ (20, 80]
+            const logKappa = Math.log(kappa);
+            const logMin = Math.log(cfg.KAPPA_GOOD);
+            const logMax = Math.log(cfg.KAPPA_ACCEPTABLE);
+            const ratio = (logKappa - logMin) / (logMax - logMin);
+            I_norm = 0.5 - 0.4 * ratio;  // 0.5 → 0.1
+            
+        } else {
+            // 可接受到极限：κ ∈ (80, 150]
+            const logKappa = Math.log(kappa);
+            const logMin = Math.log(cfg.KAPPA_ACCEPTABLE);
+            const logMax = Math.log(cfg.KAPPA_LIMIT);
+            const ratio = (logKappa - logMin) / (logMax - logMin);
+            I_norm = 0.1 - 0.1 * ratio;  // 0.1 → 0.0
+        }
+        
+        // 确保在 [0, 1] 范围内
+        return Math.max(0, Math.min(1, I_norm));
+    }
+    
+    /**
+     * 计算综合灵活度指数
+     * D = 0.4 × M_norm + 0.6 × I_norm （满足硬约束前提下）
+     * @param {THREE.Vector3} position 测试点位置
+     * @param {number} maxManipulability 工作空间内的最大可操作度（用于归一化）
+     * @returns {Object} {dexterity, manipulability, isotropy, rawManip, kappa}
+     */
+    function computeDexterityIndex(position, maxManipulability = 1.0) {
+        // 初始化返回值（不可达情况）
+        const nullResult = { 
+            dexterity: 0, 
+            manipulability: 0, 
+            isotropy: 0, 
+            rawManip: 0, 
+            kappa: Infinity 
+        };
+        
+        if (joints.length === 0) {
+            return nullResult;
+        }
+        
+        // 步骤1: 使用IK求解找到可达该点的关节配置
+        const targetPos = position.clone();
+        const result = RobotArmIK ? RobotArmIK.solveCCDPosition(joints, jointValues, targetPos) : null;
+        
+        // IK失败或误差过大，判定为不可达
+        if (!result || !result.values || result.error > DEXTERITY_CONFIG.MAX_IK_ERROR) {
+            return nullResult;
+        }
+        
+        // 步骤2: 计算雅可比矩阵的 J·J^T
+        const JJT = computeJJT(result.values);
+        if (!JJT) {
+            return nullResult;
+        }
+        
+        // 步骤3: 计算原始可操作度 M
+        const rawManip = computeManipulability(JJT);
+        
+        // 步骤4: 计算归一化可操作度 M_norm = M / M_max
+        const M_norm = maxManipulability > DEXTERITY_CONFIG.MIN_DET_THRESHOLD 
+            ? Math.min(1, rawManip / maxManipulability) 
+            : 0;
+        
+        // 步骤5: 计算条件数 κ
+        const kappa = computeConditionNumber(JJT);
+        
+        // 步骤6: 计算归一化各向同性指数 I_norm（包含软约束）
+        const I_norm = computeNormalizedIsotropy(kappa);
+        
+        // 步骤7: 计算综合灵活度指数（使用均衡权重）
+        // D = 0.5 × M_norm + 0.5 × I_norm
+        const dexterity = DEXTERITY_CONFIG.WEIGHT_MANIPULABILITY * M_norm + 
+                         DEXTERITY_CONFIG.WEIGHT_ISOTROPY * I_norm;
+        
+        return {
+            dexterity: dexterity,      // 综合灵活度 [0, 1]
+            manipulability: M_norm,    // 归一化可操作度 [0, 1]
+            isotropy: I_norm,          // 归一化各向同性 [0, 1]
+            rawManip: rawManip,        // 原始可操作度（用于第一阶段统计）
+            kappa: kappa               // 条件数（用于调试）
+        };
+    }
+
     // ========================================
     // IK交互初始化
     // ========================================
@@ -1630,12 +2203,28 @@ const RobotArm = (function() {
         isRendering = true;
         cancelRendering = false;
 
+        // 读取参数
+        const computeDexterous = document.getElementById('compute-dexterous').checked;
+        const showGradient = document.getElementById('show-gradient').checked;
+        const dexterousThreshold = parseFloat(document.getElementById('dexterous-threshold').value) || 0.5;
+
         // 体积显示初始化
         const volumeBox = document.getElementById('workspace-volume');
-        const volumeVal = document.getElementById('workspace-volume-value');
-        if (volumeBox && volumeVal) {
+        const reachableVolumeVal = document.getElementById('reachable-volume-value');
+        const dexterousInfo = document.getElementById('dexterous-info');
+        const dexterousVolumeVal = document.getElementById('dexterous-volume-value');
+        const dexterousPercentageVal = document.getElementById('dexterous-percentage-value');
+        
+        if (volumeBox && reachableVolumeVal) {
             volumeBox.style.display = 'block';
-            volumeVal.textContent = '计算中...';
+            reachableVolumeVal.textContent = '计算中...';
+            if (dexterousInfo) {
+                dexterousInfo.style.display = computeDexterous ? 'block' : 'none';
+                if (computeDexterous) {
+                    dexterousVolumeVal.textContent = '计算中...';
+                    dexterousPercentageVal.textContent = '计算中...';
+                }
+            }
         }
 
         const btn = document.getElementById('render-workspace-btn');
@@ -1649,7 +2238,8 @@ const RobotArm = (function() {
 
         const targetSamples = parseInt(document.getElementById('workspace-samples').value) || 1000000;
         const voxelSize = Math.max(1, parseFloat(document.getElementById('voxel-size').value) || 50);
-        const points = [];
+        const reachablePoints = [];
+        const dexterityData = []; // 存储{point, dexterity}
         const batchSize = 1000;
 
         try {
@@ -1672,64 +2262,201 @@ const RobotArm = (function() {
                     });
                     
                     const pos = computeEndPosition(config);
-                    points.push(pos);
+                    reachablePoints.push(pos);
                 }
 
                 const progress = Math.round(((i + batch) / targetSamples) * 100);
                 progressBar.style.width = progress + '%';
-                progressText.textContent = progress + '%';
+                progressText.textContent = `采样: ${progress}%`;
 
                 await new Promise(r => setTimeout(r, 0));
             }
 
-            if (!cancelRendering && points.length > 0) {
+            // 如果需要计算灵活度，进行第二阶段分析
+            if (computeDexterous && !cancelRendering && reachablePoints.length > 0) {
+                progressText.textContent = '分析灵活度分布...';
+                progressBar.style.width = '0%';
+                
+                // 对可达空间的点进行体素化，减少需要测试的点数
+                const voxelMap = new Map();
+                const inv = 1 / voxelSize;
+                
+                for (let i = 0; i < reachablePoints.length; i++) {
+                    const p = reachablePoints[i];
+                    const key = `${Math.floor(p.x * inv)},${Math.floor(p.y * inv)},${Math.floor(p.z * inv)}`;
+                    if (!voxelMap.has(key)) {
+                        voxelMap.set(key, p.clone());
+                    }
+                }
+                
+                const uniquePoints = Array.from(voxelMap.values());
+                progressText.textContent = `计算 ${uniquePoints.length} 个体素的灵活度...`;
+                
+                // 第一阶段：计算所有点的原始可操作度，找到最大值
+                progressText.textContent = '第1阶段: 计算可操作度范围...';
+                const rawManipValues = [];
+                for (let i = 0; i < uniquePoints.length && !cancelRendering; i++) {
+                    const point = uniquePoints[i];
+                    const result = computeDexterityIndex(point, 1); // 第一阶段：只用于获取原始可操作度
+                    rawManipValues.push(result.rawManip);
+                    
+                    if (i % 100 === 0) {
+                        const progress = Math.round((i / uniquePoints.length) * 50);
+                        progressBar.style.width = progress + '%';
+                        progressText.textContent = `第1阶段: ${progress}%`;
+                        await new Promise(r => setTimeout(r, 0));
+                    }
+                }
+                
+                const maxManipulability = Math.max(...rawManipValues, 1e-10);
+                console.log('最大可操作度:', maxManipulability);
+                
+                // 第二阶段：计算综合灵活度指数（使用固定权重0.4和0.6）
+                progressText.textContent = '第2阶段: 计算综合灵活度...';
+                for (let i = 0; i < uniquePoints.length && !cancelRendering; i++) {
+                    const point = uniquePoints[i];
+                    const result = computeDexterityIndex(point, maxManipulability);
+                    
+                    if (result.dexterity > 0) {
+                        dexterityData.push({
+                            point: point,
+                            dexterity: result.dexterity,
+                            manipulability: result.manipulability,
+                            isotropy: result.isotropy
+                        });
+                    }
+                    
+                    if (i % 50 === 0) {
+                        const progress = 50 + Math.round((i / uniquePoints.length) * 50);
+                        progressBar.style.width = progress + '%';
+                        progressText.textContent = `第2阶段: ${progress - 50}% (${dexterityData.length}/${i+1})`;
+                        await new Promise(r => setTimeout(r, 0));
+                    }
+                }
+            }
+
+            if (!cancelRendering && reachablePoints.length > 0) {
                 // 计算Z范围
                 let minZ = Infinity, maxZ = -Infinity;
-                points.forEach(p => {
+                reachablePoints.forEach(p => {
                     minZ = Math.min(minZ, p.z);
                     maxZ = Math.max(maxZ, p.z);
                 });
                 const zRange = maxZ - minZ || 1;
 
-                // 创建点云
-                const geometry = new THREE.BufferGeometry();
-                const positions = new Float32Array(points.length * 3);
-                const colors = new Float32Array(points.length * 3);
+                // 创建可达空间点云（蓝色渐变）
+                const reachableGeometry = new THREE.BufferGeometry();
+                const reachablePositions = new Float32Array(reachablePoints.length * 3);
+                const reachableColors = new Float32Array(reachablePoints.length * 3);
 
-                points.forEach((p, i) => {
-                    positions[i * 3] = p.x;
-                    positions[i * 3 + 1] = p.y;
-                    positions[i * 3 + 2] = p.z;
+                reachablePoints.forEach((p, i) => {
+                    reachablePositions[i * 3] = p.x;
+                    reachablePositions[i * 3 + 1] = p.y;
+                    reachablePositions[i * 3 + 2] = p.z;
 
-                    const hue = (1 - (p.z - minZ) / zRange) * 0.7;
+                    const hue = (1 - (p.z - minZ) / zRange) * 0.6 + 0.5; // 蓝-青色
                     const color = new THREE.Color();
-                    color.setHSL(hue, 0.9, 0.5);
-                    colors[i * 3] = color.r;
-                    colors[i * 3 + 1] = color.g;
-                    colors[i * 3 + 2] = color.b;
+                    color.setHSL(hue, 0.8, 0.5);
+                    reachableColors[i * 3] = color.r;
+                    reachableColors[i * 3 + 1] = color.g;
+                    reachableColors[i * 3 + 2] = color.b;
                 });
 
-                geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                reachableGeometry.setAttribute('position', new THREE.BufferAttribute(reachablePositions, 3));
+                reachableGeometry.setAttribute('color', new THREE.BufferAttribute(reachableColors, 3));
 
-                const material = new THREE.PointsMaterial({
-                    size: points.length > 1000000 ? 1 : 2,
+                const reachableMaterial = new THREE.PointsMaterial({
+                    size: reachablePoints.length > 1000000 ? 1 : 2,
                     vertexColors: true,
                     transparent: true,
-                    opacity: 0.7
+                    opacity: 0.5
                 });
 
-                const pointCloud = new THREE.Points(geometry, material);
-                scene.add(pointCloud);
-                workspacePoints.push(pointCloud);
+                const reachableCloud = new THREE.Points(reachableGeometry, reachableMaterial);
+                scene.add(reachableCloud);
+                workspacePoints.push(reachableCloud);
 
-                progressText.textContent = `完成 (${points.length.toLocaleString()}点) - 共${workspacePoints.length}个点云`;
+                // 如果有灵活度数据，创建灵活度可视化点云
+                if (dexterityData.length > 0) {
+                    const dexterousGeometry = new THREE.BufferGeometry();
+                    const dexterousPositions = new Float32Array(dexterityData.length * 3);
+                    const dexterousColors = new Float32Array(dexterityData.length * 3);
 
-            // 计算体素体积估计
-            const volume = computeWorkspaceVolume(points, voxelSize); // m^3
-            if (volumeBox && volumeVal) {
-                volumeVal.textContent = `${volume.toLocaleString(undefined, { maximumFractionDigits: 6, minimumFractionDigits: 3 })}`;
-            }
+                    dexterityData.forEach((data, i) => {
+                        const p = data.point;
+                        dexterousPositions[i * 3] = p.x;
+                        dexterousPositions[i * 3 + 1] = p.y;
+                        dexterousPositions[i * 3 + 2] = p.z;
+
+                        if (showGradient) {
+                            // 渐变色：红色(低灵活度) -> 黄色 -> 绿色(高灵活度)
+                            // dexterity: 0-1
+                            let hue, saturation, lightness;
+                            if (data.dexterity < 0.5) {
+                                // 红到黄：hue 0° -> 60°
+                                hue = data.dexterity * 0.334; // 0 -> 0.167
+                                saturation = 0.9;
+                                lightness = 0.4 + data.dexterity * 0.1;
+                            } else {
+                                // 黄到绿：hue 60° -> 120°
+                                hue = 0.167 + ((data.dexterity - 0.5) * 0.334); // 0.167 -> 0.334
+                                saturation = 0.85;
+                                lightness = 0.45 + (data.dexterity - 0.5) * 0.1;
+                            }
+                            
+                            const color = new THREE.Color();
+                            color.setHSL(hue, saturation, lightness);
+                            dexterousColors[i * 3] = color.r;
+                            dexterousColors[i * 3 + 1] = color.g;
+                            dexterousColors[i * 3 + 2] = color.b;
+                        } else {
+                            // 单色高亮（绿色）- 强度与灵活度成正比
+                            const intensity = 0.3 + data.dexterity * 0.7;
+                            dexterousColors[i * 3] = 0;
+                            dexterousColors[i * 3 + 1] = intensity;
+                            dexterousColors[i * 3 + 2] = 0;
+                        }
+                    });
+
+                    dexterousGeometry.setAttribute('position', new THREE.BufferAttribute(dexterousPositions, 3));
+                    dexterousGeometry.setAttribute('color', new THREE.BufferAttribute(dexterousColors, 3));
+
+                    const dexterousMaterial = new THREE.PointsMaterial({
+                        size: dexterityData.length > 100000 ? 2 : 3,
+                        vertexColors: true,
+                        transparent: true,
+                        opacity: 0.9
+                    });
+
+                    const dexterousCloud = new THREE.Points(dexterousGeometry, dexterousMaterial);
+                    scene.add(dexterousCloud);
+                    workspacePoints.push(dexterousCloud);
+                }
+
+                // 计算体积
+                const reachableVolume = computeWorkspaceVolume(reachablePoints, voxelSize);
+                const dexterousPoints = dexterityData.filter(d => d.dexterity >= dexterousThreshold).map(d => d.point);
+                const dexterousVolume = computeDexterous ? computeWorkspaceVolume(dexterousPoints, voxelSize) : 0;
+                const percentage = reachableVolume > 0 ? (dexterousVolume / reachableVolume * 100) : 0;
+
+                // 统计灵活度分布
+                const avgDexterity = dexterityData.length > 0 
+                    ? dexterityData.reduce((sum, d) => sum + d.dexterity, 0) / dexterityData.length 
+                    : 0;
+
+                // 更新UI
+                if (reachableVolumeVal) {
+                    reachableVolumeVal.textContent = `${reachableVolume.toLocaleString(undefined, { maximumFractionDigits: 6, minimumFractionDigits: 3 })}`;
+                }
+                
+                if (computeDexterous && dexterousVolumeVal && dexterousPercentageVal) {
+                    dexterousVolumeVal.textContent = `${dexterousVolume.toLocaleString(undefined, { maximumFractionDigits: 6, minimumFractionDigits: 3 })}`;
+                    dexterousPercentageVal.textContent = `${percentage.toFixed(2)}`;
+                }
+                
+                progressText.textContent = computeDexterous 
+                    ? `完成 (可达:${reachablePoints.length.toLocaleString()}点, 灵活:${dexterousPoints.length}点, 平均灵活度:${avgDexterity.toFixed(3)})`
+                    : `完成 (${reachablePoints.length.toLocaleString()}点)`;
             }
         } finally {
             isRendering = false;
@@ -1738,7 +2465,7 @@ const RobotArm = (function() {
 
             setTimeout(() => {
                 progressContainer.style.display = 'none';
-            }, 2000);
+            }, 3000);
         }
     }
 
@@ -1757,10 +2484,25 @@ const RobotArm = (function() {
 
         // 重置体积显示
         const volumeBox = document.getElementById('workspace-volume');
-        const volumeVal = document.getElementById('workspace-volume-value');
-        if (volumeBox && volumeVal) {
+        const reachableVolumeVal = document.getElementById('reachable-volume-value');
+        const dexterousInfo = document.getElementById('dexterous-info');
+        const dexterousVolumeVal = document.getElementById('dexterous-volume-value');
+        const dexterousPercentageVal = document.getElementById('dexterous-percentage-value');
+        
+        if (volumeBox) {
             volumeBox.style.display = 'none';
-            volumeVal.textContent = '--';
+        }
+        if (reachableVolumeVal) {
+            reachableVolumeVal.textContent = '--';
+        }
+        if (dexterousInfo) {
+            dexterousInfo.style.display = 'none';
+        }
+        if (dexterousVolumeVal) {
+            dexterousVolumeVal.textContent = '--';
+        }
+        if (dexterousPercentageVal) {
+            dexterousPercentageVal.textContent = '--';
         }
     }
 
